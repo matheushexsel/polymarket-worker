@@ -1,6 +1,12 @@
+// src/index.js
+
 import express from "express";
 import { ethers } from "ethers";
+import { Buffer } from "buffer";
 import { ClobClient, Side, OrderType } from "@polymarket/clob-client";
+
+// Buffer polyfill for ESM runtimes / SDK internals
+globalThis.Buffer = Buffer;
 
 const app = express();
 app.use(express.json());
@@ -9,12 +15,12 @@ app.use(express.json());
    ENV
 ======================= */
 const WORKER_SECRET = process.env.WORKER_SECRET;
+
 const PM_PRIVATE_KEY = process.env.PM_PRIVATE_KEY;
 const PM_CLOB_HOST = process.env.PM_CLOB_HOST || "https://clob.polymarket.com";
 const PM_GAMMA_HOST = process.env.PM_GAMMA_HOST || "https://gamma-api.polymarket.com";
 const PM_SIGNATURE_TYPE = Number(process.env.PM_SIGNATURE_TYPE || 0);
 
-// Explicit L2 creds (required for this version)
 const PM_API_KEY = process.env.PM_API_KEY;
 const PM_API_SECRET = process.env.PM_API_SECRET;
 const PM_API_PASSPHRASE = process.env.PM_API_PASSPHRASE;
@@ -22,18 +28,16 @@ const PM_API_PASSPHRASE = process.env.PM_API_PASSPHRASE;
 const PORT = Number(process.env.PORT || 3000);
 const CHAIN_ID = 137; // Polygon mainnet
 
-if (!WORKER_SECRET) {
-  console.error("Missing WORKER_SECRET");
+function die(msg) {
+  console.error(msg);
   process.exit(1);
 }
-if (!PM_PRIVATE_KEY) {
-  console.error("Missing PM_PRIVATE_KEY");
-  process.exit(1);
-}
-if (!PM_API_KEY || !PM_API_SECRET || !PM_API_PASSPHRASE) {
-  console.error("Missing one or more L2 API credentials: PM_API_KEY / PM_API_SECRET / PM_API_PASSPHRASE");
-  process.exit(1);
-}
+
+if (!WORKER_SECRET) die("Missing WORKER_SECRET");
+if (!PM_PRIVATE_KEY) die("Missing PM_PRIVATE_KEY");
+if (!PM_API_KEY) die("Missing PM_API_KEY");
+if (!PM_API_SECRET) die("Missing PM_API_SECRET");
+if (!PM_API_PASSPHRASE) die("Missing PM_API_PASSPHRASE");
 
 /* =======================
    AUTH
@@ -71,11 +75,12 @@ async function initClient() {
       walletAddress = await wallet.getAddress();
       console.log(`[Worker] Wallet: ${walletAddress}`);
 
-      // IMPORTANT: credential key names
+      // IMPORTANT: many clob-client versions expect these EXACT keys:
+      // apiKey, secret, passphrase
       const creds = {
         apiKey: PM_API_KEY,
-        apiSecret: PM_API_SECRET,
-        apiPassphrase: PM_API_PASSPHRASE
+        secret: PM_API_SECRET,
+        passphrase: PM_API_PASSPHRASE,
       };
 
       clobClient = new ClobClient(PM_CLOB_HOST, CHAIN_ID, wallet, creds, PM_SIGNATURE_TYPE);
@@ -92,11 +97,65 @@ async function initClient() {
 }
 
 /* =======================
+   SDK HELPERS
+======================= */
+function getClientMethodNames(client) {
+  try {
+    const proto = Object.getPrototypeOf(client);
+    const names = new Set([
+      ...Object.getOwnPropertyNames(proto || {}),
+      ...Object.keys(client || {}),
+    ]);
+    return Array.from(names).sort();
+  } catch {
+    return [];
+  }
+}
+
+async function safeGetOrders(client) {
+  // Try common variations across versions
+  if (typeof client.getOrders === "function") return await client.getOrders();
+  if (typeof client.getOpenOrders === "function") return await client.getOpenOrders();
+  if (typeof client.getActiveOrders === "function") return await client.getActiveOrders();
+  if (typeof client.listOrders === "function") return await client.listOrders();
+  throw new Error("No supported orders method found on client (expected getOrders/getOpenOrders/etc).");
+}
+
+async function safePlaceOrder(client, params, options) {
+  // options: { tickSize, negRisk, orderType }
+  const orderType = options?.orderType ?? OrderType?.GTC;
+
+  // Preferred method
+  if (typeof client.createAndPostOrder === "function") {
+    return await client.createAndPostOrder(params, options, orderType);
+  }
+
+  // Next best: createOrder + postOrder
+  if (typeof client.createOrder === "function" && typeof client.postOrder === "function") {
+    const created = await client.createOrder(params, options, orderType);
+    // Some versions return a signed order object that you then submit
+    return await client.postOrder(created);
+  }
+
+  // Some versions accept postOrder directly with params
+  if (typeof client.postOrder === "function") {
+    return await client.postOrder(params, options, orderType);
+  }
+
+  // As a last resort, at least create the order (won’t execute trade)
+  if (typeof client.createOrder === "function") {
+    const created = await client.createOrder(params, options, orderType);
+    return { createdOnly: true, created };
+  }
+
+  throw new Error("No supported place-order method found on client (expected createAndPostOrder/createOrder+postOrder/postOrder).");
+}
+
+/* =======================
    ROUTES
 ======================= */
 
 app.get("/health", async (req, res) => {
-  // We do NOT force-init here; /orders or /place will.
   res.json({
     ok: true,
     walletAddress: walletAddress || null,
@@ -104,15 +163,45 @@ app.get("/health", async (req, res) => {
     clobHost: PM_CLOB_HOST,
     gammaHost: PM_GAMMA_HOST,
     signatureType: PM_SIGNATURE_TYPE,
-    timestamp: new Date().toISOString()
+    nodeVersion: process.version,
+    bufferType: typeof globalThis.Buffer,
+    timestamp: new Date().toISOString(),
   });
 });
 
-// List open orders (proves you're on the new build)
+// THIS IS THE KEY DEBUG ENDPOINT — MUST NOT 404
+app.get("/sdk", requireAuth, async (req, res) => {
+  try {
+    const client = await initClient();
+    const methods = getClientMethodNames(client);
+
+    res.json({
+      ok: true,
+      nodeVersion: process.version,
+      bufferType: typeof globalThis.Buffer,
+      clobHost: PM_CLOB_HOST,
+      signatureType: PM_SIGNATURE_TYPE,
+      walletAddress: walletAddress || null,
+      sdk: {
+        hasCreateAndPostOrder: typeof client.createAndPostOrder === "function",
+        hasCreateOrder: typeof client.createOrder === "function",
+        hasPostOrder: typeof client.postOrder === "function",
+        hasGetOrders: typeof client.getOrders === "function",
+        hasGetOpenOrders: typeof client.getOpenOrders === "function",
+        hasGetBalanceAllowance: typeof client.getBalanceAllowance === "function",
+        hasCancelOrder: typeof client.cancelOrder === "function",
+      },
+      clientMethods: methods,
+    });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err?.message || String(err) });
+  }
+});
+
 app.get("/orders", requireAuth, async (req, res) => {
   try {
     const client = await initClient();
-    const orders = await client.getOpenOrders();
+    const orders = await safeGetOrders(client);
     return res.json({ success: true, count: orders?.length || 0, orders });
   } catch (err) {
     return res.status(500).json({ success: false, error: err?.message || String(err) });
@@ -133,6 +222,7 @@ app.post("/place", requireAuth, async (req, res) => {
     if (!tokenId || !side || typeof price !== "number" || typeof size !== "number") {
       return res.status(400).json({ success: false, error: "invalid_body" });
     }
+
     const normalizedSide = String(side).toUpperCase();
     if (normalizedSide !== "BUY" && normalizedSide !== "SELL") {
       return res.status(400).json({ success: false, error: "side_must_be_BUY_or_SELL" });
@@ -144,25 +234,34 @@ app.post("/place", requireAuth, async (req, res) => {
       return res.status(400).json({ success: false, error: "size_must_be_positive" });
     }
 
-    console.log(`[Worker] ${dryRun ? "[DRY-RUN] " : ""}PLACE ${normalizedSide} token=${String(tokenId).slice(0, 16)}... price=${price} size=${size}`);
+    console.log(
+      `[Worker] ${dryRun ? "[DRY-RUN] " : ""}PLACE ${normalizedSide} token=${String(tokenId).slice(0, 18)}... price=${price} size=${size}`
+    );
 
     const client = await initClient();
 
     if (dryRun) {
+      // Validate client supports placing orders
+      const canPlace =
+        typeof client.createAndPostOrder === "function" ||
+        (typeof client.createOrder === "function" && typeof client.postOrder === "function") ||
+        typeof client.postOrder === "function";
+
       return res.json({
         success: true,
         dryRun: true,
+        canPlace,
         orderId: null,
-        message: "validated_only"
+        message: "validated_only",
       });
     }
 
     const sideEnum = normalizedSide === "BUY" ? Side.BUY : Side.SELL;
 
-    const resp = await client.createAndPostOrder(
+    const resp = await safePlaceOrder(
+      client,
       { tokenID: tokenId, price, size, side: sideEnum },
-      { tickSize, negRisk },
-      OrderType.GTC
+      { tickSize, negRisk, orderType: OrderType?.GTC }
     );
 
     const orderId = resp?.orderID || resp?.id || resp?.order_id || null;
@@ -171,7 +270,7 @@ app.post("/place", requireAuth, async (req, res) => {
       success: true,
       dryRun: false,
       orderId,
-      response: resp
+      response: resp,
     });
   } catch (err) {
     console.error("[Worker] /place error:", err?.message || err);
@@ -190,12 +289,14 @@ app.post("/cancel", requireAuth, async (req, res) => {
     const { orderId } = req.body || {};
     if (!orderId) return res.status(400).json({ success: false, error: "missing_orderId" });
 
-    console.log(`[Worker] ${dryRun ? "[DRY-RUN] " : ""}CANCEL orderId=${orderId}`);
-
     const client = await initClient();
 
     if (dryRun) {
       return res.json({ success: true, dryRun: true, cancelled: false, message: "validated_only" });
+    }
+
+    if (typeof client.cancelOrder !== "function") {
+      return res.status(500).json({ success: false, error: "cancelOrder_not_supported_by_installed_sdk" });
     }
 
     const result = await client.cancelOrder(orderId);
@@ -216,6 +317,11 @@ app.get("/positions", requireAuth, async (req, res) => {
     if (!tokenId) return res.status(400).json({ success: false, error: "missing_tokenId" });
 
     const client = await initClient();
+
+    if (typeof client.getBalanceAllowance !== "function") {
+      return res.status(500).json({ success: false, error: "getBalanceAllowance_not_supported_by_installed_sdk" });
+    }
+
     const bal = await client.getBalanceAllowance(tokenId);
     const shares = Number(bal?.balance || 0);
 
@@ -230,7 +336,6 @@ app.get("/positions", requireAuth, async (req, res) => {
    START
 ======================= */
 app.listen(PORT, () => {
-  console.log(`[Worker] worker listening on ${PORT}`);
-  // Don't crash service if init fails at startup; endpoints will surface the error.
+  console.log(`[Worker] listening on ${PORT}`);
   initClient().catch((e) => console.error("[Worker] init on start failed:", e?.message || e));
 });
