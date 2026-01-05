@@ -3,7 +3,6 @@ import { webcrypto } from "node:crypto";
 import { Wallet } from "ethers"; // ethers v5
 import { ClobClient, Side, OrderType } from "@polymarket/clob-client";
 
-// --- WebCrypto polyfill (Node 18 needs this for some SDK crypto paths)
 if (!globalThis.crypto) globalThis.crypto = webcrypto;
 
 const app = express();
@@ -13,21 +12,17 @@ app.use(express.json());
    ENV
 ======================= */
 const WORKER_SECRET = process.env.WORKER_SECRET;
-
-// Your Polymarket-connected EOA private key (the one you already used)
 const PM_PRIVATE_KEY = process.env.PM_PRIVATE_KEY;
 
 const PM_CLOB_HOST = process.env.PM_CLOB_HOST || "https://clob.polymarket.com";
 const PM_GAMMA_HOST = process.env.PM_GAMMA_HOST || "https://gamma-api.polymarket.com";
 
-// You said: trade via Polymarket.com account using GNOSIS_SAFE mode
-// SIGNATURE_TYPE = 2 and FUNDER_ADDRESS = proxy wallet
 const PM_SIGNATURE_TYPE = Number(process.env.PM_SIGNATURE_TYPE ?? 2);
 const PM_FUNDER_ADDRESS =
   process.env.PM_FUNDER_ADDRESS || "0xEa50b96ea3F25BD138d9A8A04B19570058e84929";
 
 const PORT = Number(process.env.PORT || 3000);
-const CHAIN_ID = 137; // Polygon mainnet
+const CHAIN_ID = 137;
 
 if (!WORKER_SECRET) {
   console.error("Missing WORKER_SECRET");
@@ -48,7 +43,6 @@ function requireAuth(req, res, next) {
   }
   next();
 }
-
 function isDryRun(req) {
   return req.headers["x-dry-run"] === "1" || req.headers["x-dry-run"] === "true";
 }
@@ -66,21 +60,12 @@ async function initClient() {
   if (clientInitPromise) return clientInitPromise;
 
   clientInitPromise = (async () => {
-    console.log("[BOOT] version=fok-v1");
-    console.log(`[BOOT] host=${PM_CLOB_HOST} chain=${CHAIN_ID} sigType=${PM_SIGNATURE_TYPE}`);
-    console.log(`[BOOT] funder=${PM_FUNDER_ADDRESS}`);
-
-    signer = new Wallet(PM_PRIVATE_KEY); // ethers v5 wallet
+    signer = new Wallet(PM_PRIVATE_KEY);
     signerAddress = await signer.getAddress();
-    console.log(`[BOOT] signer=${signerAddress}`);
 
-    // Step 1: initialize minimal client (no L2 creds)
     const tmp = new ClobClient(PM_CLOB_HOST, CHAIN_ID, signer);
-
-    // Step 2: derive USER api creds from private key (this is critical)
     const userApiCreds = await tmp.createOrDeriveApiKey();
 
-    // Step 3: reinitialize with full auth (sig type + funder address)
     clobClient = new ClobClient(
       PM_CLOB_HOST,
       CHAIN_ID,
@@ -90,7 +75,6 @@ async function initClient() {
       PM_FUNDER_ADDRESS
     );
 
-    console.log("[BOOT] CLOB client ready");
     return clobClient;
   })();
 
@@ -100,11 +84,9 @@ async function initClient() {
 /* =======================
    ROUTES
 ======================= */
-
-// Deployment verification
 app.get("/version", (req, res) => {
   res.json({
-    version: "fok-v1",
+    version: "fok-ticksize-v1",
     node: process.version,
     signer: signerAddress || null,
     funder: PM_FUNDER_ADDRESS,
@@ -115,7 +97,7 @@ app.get("/version", (req, res) => {
   });
 });
 
-app.get("/health", async (req, res) => {
+app.get("/health", (req, res) => {
   res.json({
     ok: true,
     clientStatus: clobClient ? "ready" : clientInitPromise ? "initializing" : "not_initialized",
@@ -128,7 +110,6 @@ app.get("/health", async (req, res) => {
   });
 });
 
-// Open orders (debug + monitoring)
 app.get("/orders", requireAuth, async (req, res) => {
   try {
     const client = await initClient();
@@ -140,7 +121,7 @@ app.get("/orders", requireAuth, async (req, res) => {
 });
 
 /**
- * Place order (supports FOK)
+ * POST /place
  * Body: { tokenId, side, price, size, tickSize, negRisk, orderType? }
  * orderType: "FOK" | "IOC" | "GTC" (default FOK)
  */
@@ -167,19 +148,22 @@ app.post("/place", requireAuth, async (req, res) => {
       return res.status(400).json({ success: false, error: "side_must_be_BUY_or_SELL" });
     }
 
-    if (!(price > 0 && price < 1)) {
-      return res.status(400).json({ success: false, error: "price_must_be_between_0_and_1" });
-    }
-    if (!(size > 0)) {
-      return res.status(400).json({ success: false, error: "size_must_be_positive" });
-    }
-
-    // tickSize/negRisk should be passed from the caller (edge function)
     if (!tickSize || typeof tickSize !== "string") {
       return res.status(400).json({ success: false, error: "tickSize_required_as_string" });
     }
     if (typeof negRisk !== "boolean") {
       return res.status(400).json({ success: false, error: "negRisk_required_as_boolean" });
+    }
+
+    // Safety clamp: SDK requires 0 < price < 1
+    const tick = Number(tickSize);
+    const clampedPrice = Math.max(tick, Math.min(price, 0.999));
+
+    if (!(clampedPrice > 0 && clampedPrice < 1)) {
+      return res.status(400).json({ success: false, error: "price_must_be_between_0_and_1" });
+    }
+    if (!(size > 0)) {
+      return res.status(400).json({ success: false, error: "size_must_be_positive" });
     }
 
     const client = await initClient();
@@ -188,40 +172,30 @@ app.post("/place", requireAuth, async (req, res) => {
       return res.json({
         success: true,
         dryRun: true,
+        orderId: null,
         message: "validated_only",
-        params: { tokenId, side: normalizedSide, price, size, tickSize, negRisk, orderType }
+        params: { tokenId, side: normalizedSide, price: clampedPrice, size, tickSize, negRisk, orderType }
       });
     }
 
     const sideEnum = normalizedSide === "BUY" ? Side.BUY : Side.SELL;
 
-    // Map orderType string to SDK enum
     const ot = String(orderType).toUpperCase();
     const orderTypeEnum =
       ot === "IOC" ? OrderType.IOC :
       ot === "GTC" ? OrderType.GTC :
-      OrderType.FOK; // default
-
-    console.log(
-      `[PLACE] ${ot} ${normalizedSide} token=${String(tokenId).slice(0, 18)}... price=${price} size=${size} tick=${tickSize} negRisk=${negRisk}`
-    );
+      OrderType.FOK;
 
     const resp = await client.createAndPostOrder(
-      { tokenID: tokenId, price, size, side: sideEnum },
+      { tokenID: tokenId, price: clampedPrice, size, side: sideEnum },
       { tickSize, negRisk },
       orderTypeEnum
     );
 
     const orderId = resp?.orderID || resp?.id || resp?.order_id || null;
 
-    return res.json({
-      success: true,
-      dryRun: false,
-      orderId,
-      response: resp
-    });
+    return res.json({ success: true, dryRun: false, orderId, response: resp });
   } catch (err) {
-    // IMPORTANT: If Polymarket returns a structured error, bubble it up
     return res.status(500).json({
       success: false,
       error: err?.message || String(err),
@@ -265,11 +239,7 @@ app.get("/positions", requireAuth, async (req, res) => {
   }
 });
 
-/* =======================
-   START
-======================= */
 app.listen(PORT, () => {
   console.log(`[Worker] listening on ${PORT}`);
-  // Attempt warm init (non-fatal if it fails)
   initClient().catch((e) => console.error("[Worker] init failed:", e?.message || e));
 });
