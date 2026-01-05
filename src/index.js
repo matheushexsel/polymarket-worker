@@ -1,11 +1,10 @@
 import express from "express";
 import { webcrypto } from "node:crypto";
-
-// Ensure WebCrypto is available (Node 18 sometimes needs this explicitly)
-if (!globalThis.crypto) globalThis.crypto = webcrypto;
-
-import { ethers } from "ethers"; // MUST be ethers v5 (see package.json)
+import { Wallet } from "ethers"; // MUST be ethers v5.x
 import { ClobClient, Side, OrderType } from "@polymarket/clob-client";
+
+// Ensure crypto.subtle exists in Node 18 (Railway often runs Node 18)
+if (!globalThis.crypto) globalThis.crypto = webcrypto;
 
 const app = express();
 app.use(express.json());
@@ -16,30 +15,27 @@ app.use(express.json());
 const WORKER_SECRET = process.env.WORKER_SECRET;
 
 const PM_PRIVATE_KEY = process.env.PM_PRIVATE_KEY;
-const PM_CLOB_HOST = (process.env.PM_CLOB_HOST || "https://clob.polymarket.com").trim();
-const PM_GAMMA_HOST = (process.env.PM_GAMMA_HOST || "https://gamma-api.polymarket.com").trim();
-const PM_SIGNATURE_TYPE = Number(process.env.PM_SIGNATURE_TYPE || 0);
+const PM_CLOB_HOST = process.env.PM_CLOB_HOST || "https://clob.polymarket.com";
+const PM_GAMMA_HOST = process.env.PM_GAMMA_HOST || "https://gamma-api.polymarket.com";
 
-// L2 API creds (these must come from Polymarket API keys page)
-const PM_API_KEY = (process.env.PM_API_KEY || "").trim();
-const PM_API_SECRET = (process.env.PM_API_SECRET || "").trim();
-const PM_API_PASSPHRASE = (process.env.PM_API_PASSPHRASE || "").trim();
+// You said: trade through Polymarket.com account (browser wallet connection)
+const PM_SIGNATURE_TYPE = Number(process.env.PM_SIGNATURE_TYPE || 2); // MUST be 2 for GNOSIS_SAFE (browser wallet)
+const PM_FUNDER_ADDRESS = process.env.PM_FUNDER_ADDRESS; // Your proxy wallet address
 
 const PORT = Number(process.env.PORT || 3000);
 const CHAIN_ID = 137; // Polygon mainnet
 
-// Version marker so you can confirm Railway deployed the right build
-const VERSION = "ethers5-webcrypto-v2";
-
-function die(msg) {
-  console.error(msg);
+if (!WORKER_SECRET) {
+  console.error("Missing WORKER_SECRET");
   process.exit(1);
 }
-
-if (!WORKER_SECRET) die("Missing WORKER_SECRET");
-if (!PM_PRIVATE_KEY) die("Missing PM_PRIVATE_KEY");
-if (!PM_API_KEY || !PM_API_SECRET || !PM_API_PASSPHRASE) {
-  die("Missing one or more L2 API credentials: PM_API_KEY / PM_API_SECRET / PM_API_PASSPHRASE");
+if (!PM_PRIVATE_KEY) {
+  console.error("Missing PM_PRIVATE_KEY");
+  process.exit(1);
+}
+if (!PM_FUNDER_ADDRESS) {
+  console.error("Missing PM_FUNDER_ADDRESS (proxy wallet address)");
+  process.exit(1);
 }
 
 /* =======================
@@ -48,7 +44,7 @@ if (!PM_API_KEY || !PM_API_SECRET || !PM_API_PASSPHRASE) {
 function requireAuth(req, res, next) {
   const auth = req.headers.authorization || "";
   if (auth !== `Bearer ${WORKER_SECRET}`) {
-    return res.status(401).json({ success: false, error: "unauthorized" });
+    return res.status(401).json({ error: "unauthorized" });
   }
   next();
 }
@@ -59,44 +55,50 @@ function isDryRun(req) {
 
 /* =======================
    CLOB CLIENT INIT
+   IMPORTANT: For Polymarket.com proxy mode, DO NOT paste API keys.
+   You MUST derive user creds via createOrDeriveApiKey() using your private key.
 ======================= */
-let wallet = null;
-let walletAddress = null;
-let clobClient = null;
+let signer = null;
+let signerAddress = null;
+let client = null;
 let initPromise = null;
 
 async function initClient() {
-  if (clobClient) return clobClient;
+  if (client) return client;
   if (initPromise) return initPromise;
 
   initPromise = (async () => {
     try {
-      console.log(`[BOOT] version=${VERSION}`);
-      console.log(`[Worker] CLOB Host: ${PM_CLOB_HOST}`);
-      console.log(`[Worker] Gamma Host: ${PM_GAMMA_HOST}`);
-      console.log(`[Worker] Chain ID: ${CHAIN_ID}`);
-      console.log(`[Worker] Signature Type: ${PM_SIGNATURE_TYPE}`);
+      console.log("[BOOT] version=pm-proxy-v1");
+      console.log(`[Worker] Host=${PM_CLOB_HOST} ChainId=${CHAIN_ID}`);
+      console.log(`[Worker] SignatureType=${PM_SIGNATURE_TYPE} Funder=${PM_FUNDER_ADDRESS}`);
 
-      // ethers v5 wallet (has _signTypedData which the SDK expects)
-      wallet = new ethers.Wallet(PM_PRIVATE_KEY);
-      walletAddress = await wallet.getAddress();
-      console.log(`[Worker] Wallet: ${walletAddress}`);
+      // ethers v5 wallet signer
+      signer = new Wallet(PM_PRIVATE_KEY);
+      signerAddress = await signer.getAddress();
+      console.log(`[Worker] Signer address=${signerAddress}`);
 
-      // IMPORTANT: Polymarket docs use keys: apiKey, secret, passphrase
-      // (NOT apiSecret/apiPassphrase)
-      const creds = {
-        apiKey: PM_API_KEY,
-        secret: PM_API_SECRET,
-        passphrase: PM_API_PASSPHRASE,
-      };
+      // Step 1: temp client
+      const temp = new ClobClient(PM_CLOB_HOST, CHAIN_ID, signer);
 
-      clobClient = new ClobClient(PM_CLOB_HOST, CHAIN_ID, wallet, creds, PM_SIGNATURE_TYPE);
+      // Step 2: derive USER creds (this is the key fix)
+      const userApiCreds = await temp.createOrDeriveApiKey();
+      console.log(`[Worker] Derived user API key=${String(userApiCreds?.apiKey || "").slice(0, 8)}...`);
 
-      console.log("[Worker] CLOB client initialized");
-      return clobClient;
+      // Step 3/4: full authenticated client in proxy mode
+      client = new ClobClient(
+        PM_CLOB_HOST,
+        CHAIN_ID,
+        signer,
+        userApiCreds,
+        PM_SIGNATURE_TYPE,
+        PM_FUNDER_ADDRESS
+      );
+
+      console.log("[Worker] CLOB client ready");
+      return client;
     } catch (err) {
-      console.error("[Worker] init failed:", err?.message || err);
-      clobClient = null;
+      console.error("[Worker] initClient failed:", err?.message || err);
       initPromise = null;
       throw err;
     }
@@ -109,57 +111,48 @@ async function initClient() {
    ROUTES
 ======================= */
 
-// No auth: lets you confirm the deployed build
+// Version endpoint so you can confirm Railway deployed THIS code
 app.get("/version", (req, res) => {
   res.json({
-    version: VERSION,
+    version: "pm-proxy-v1",
     node: process.version,
     timestamp: new Date().toISOString(),
   });
 });
 
-// No auth: does not force init
-app.get("/health", (req, res) => {
+app.get("/health", async (req, res) => {
   res.json({
     ok: true,
-    version: VERSION,
-    walletAddress: walletAddress || null,
-    clientStatus: clobClient ? "ready" : initPromise ? "initializing" : "not_initialized",
+    version: "pm-proxy-v1",
+    signerAddress: signerAddress || null,
+    clientStatus: client ? "ready" : initPromise ? "initializing" : "not_initialized",
     clobHost: PM_CLOB_HOST,
     gammaHost: PM_GAMMA_HOST,
+    signatureType: PM_SIGNATURE_TYPE,
+    funderAddress: PM_FUNDER_ADDRESS,
     timestamp: new Date().toISOString(),
   });
 });
 
-// Auth: list open orders (useful for verifying L2 calls)
 app.get("/orders", requireAuth, async (req, res) => {
   try {
-    const client = await initClient();
-
-    // SDK variants differ; this is the most commonly documented one in practice.
-    // If your SDK build exposes getOpenOrders(), use it.
-    if (typeof client.getOpenOrders !== "function") {
-      return res.status(500).json({
-        success: false,
-        error: "SDK missing getOpenOrders() - check @polymarket/clob-client version",
-      });
-    }
-
-    const orders = await client.getOpenOrders();
-    return res.json({ success: true, count: Array.isArray(orders) ? orders.length : null, orders });
+    const c = await initClient();
+    const openOrders = await c.getOpenOrders();
+    return res.json({ success: true, count: openOrders?.length || 0, orders: openOrders });
   } catch (err) {
+    console.error("[Worker] /orders error:", err?.message || err);
     return res.status(500).json({ success: false, error: err?.message || String(err) });
   }
 });
 
-// Auth: place limit order
-// Body: { tokenId, side, price, size, tickSize?, negRisk? }
-// Header optional: X-Dry-Run: 1
+// Place limit order
+// Body: { tokenId, side, price, size }
+// Optional: X-Dry-Run: 1
 app.post("/place", requireAuth, async (req, res) => {
   const dryRun = isDryRun(req);
 
   try {
-    const { tokenId, side, price, size, tickSize = "0.01", negRisk = false } = req.body || {};
+    const { tokenId, side, price, size } = req.body || {};
 
     if (!tokenId || !side || typeof price !== "number" || typeof size !== "number") {
       return res.status(400).json({ success: false, error: "invalid_body" });
@@ -177,92 +170,76 @@ app.post("/place", requireAuth, async (req, res) => {
     }
 
     console.log(
-      `[Worker] ${dryRun ? "[DRY-RUN] " : ""}PLACE ${normalizedSide} token=${String(tokenId).slice(
-        0,
-        18
-      )}... price=${price} size=${size}`
+      `[Worker] ${dryRun ? "[DRY-RUN] " : ""}PLACE ${normalizedSide} token=${String(tokenId).slice(0, 16)}... price=${price} size=${size}`
     );
 
-    const client = await initClient();
+    const c = await initClient();
 
     if (dryRun) {
       return res.json({ success: true, dryRun: true, orderId: null, message: "validated_only" });
     }
 
-    if (typeof client.createAndPostOrder !== "function") {
-      return res.status(500).json({
-        success: false,
-        error: "SDK missing createAndPostOrder() - check @polymarket/clob-client version",
-      });
-    }
-
     const sideEnum = normalizedSide === "BUY" ? Side.BUY : Side.SELL;
 
-    const resp = await client.createAndPostOrder(
-      { tokenID: tokenId, price, size, side: sideEnum },
-      { tickSize, negRisk },
+    // IMPORTANT: get market to use correct tickSize/negRisk
+    const market = await c.getMarket(tokenId);
+
+    const resp = await c.createAndPostOrder(
+      {
+        tokenID: tokenId,
+        price,
+        size,
+        side: sideEnum,
+      },
+      {
+        tickSize: market?.tickSize,
+        negRisk: market?.negRisk,
+      },
       OrderType.GTC
     );
 
-    const orderId = resp?.orderID || resp?.id || resp?.order_id || null;
-
-    return res.json({ success: true, dryRun: false, orderId, response: resp });
+    return res.json({
+      success: true,
+      dryRun: false,
+      orderId: resp?.orderID || null,
+      status: resp?.status || null,
+      response: resp,
+    });
   } catch (err) {
-    // If you see "Attention Required | Cloudflare", that is not a coding bug.
+    console.error("[Worker] /place error:", err?.message || err);
     return res.status(500).json({ success: false, error: err?.message || String(err) });
   }
 });
 
-// Auth: cancel order
 app.post("/cancel", requireAuth, async (req, res) => {
-  const dryRun = isDryRun(req);
-
   try {
     const { orderId } = req.body || {};
     if (!orderId) return res.status(400).json({ success: false, error: "missing_orderId" });
 
-    console.log(`[Worker] ${dryRun ? "[DRY-RUN] " : ""}CANCEL orderId=${orderId}`);
+    console.log(`[Worker] CANCEL orderId=${orderId}`);
 
-    const client = await initClient();
+    const c = await initClient();
+    const result = await c.cancelOrder(orderId);
 
-    if (dryRun) {
-      return res.json({ success: true, dryRun: true, cancelled: false, message: "validated_only" });
-    }
-
-    if (typeof client.cancelOrder !== "function") {
-      return res.status(500).json({
-        success: false,
-        error: "SDK missing cancelOrder() - check @polymarket/clob-client version",
-      });
-    }
-
-    const result = await client.cancelOrder(orderId);
-    return res.json({ success: true, dryRun: false, cancelled: true, result });
+    return res.json({ success: true, cancelled: true, result });
   } catch (err) {
+    console.error("[Worker] /cancel error:", err?.message || err);
     return res.status(500).json({ success: false, error: err?.message || String(err) });
   }
 });
 
-// Auth: positions
 app.get("/positions", requireAuth, async (req, res) => {
   try {
     const tokenId = req.query.tokenId;
     if (!tokenId) return res.status(400).json({ success: false, error: "missing_tokenId" });
 
-    const client = await initClient();
-
-    if (typeof client.getBalanceAllowance !== "function") {
-      return res.status(500).json({
-        success: false,
-        error: "SDK missing getBalanceAllowance() - check @polymarket/clob-client version",
-      });
-    }
-
-    const bal = await client.getBalanceAllowance(tokenId);
+    const c = await initClient();
+    const bal = await c.getBalanceAllowance(tokenId);
     const shares = Number(bal?.balance || 0);
 
     return res.json({ success: true, tokenId, shares, raw: bal });
   } catch (err) {
+    console.error("[Worker] /positions error:", err?.message || err);
     return res.status(500).json({ success: false, error: err?.message || String(err) });
   }
 });
