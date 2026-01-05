@@ -1,9 +1,9 @@
 import express from "express";
 import { webcrypto } from "node:crypto";
-import { Wallet } from "ethers"; // MUST be ethers v5.x
+import { Wallet } from "ethers"; // ethers v5
 import { ClobClient, Side, OrderType } from "@polymarket/clob-client";
 
-// Ensure crypto.subtle exists in Node 18 (Railway often runs Node 18)
+// --- WebCrypto polyfill (Node 18 needs this for some SDK crypto paths)
 if (!globalThis.crypto) globalThis.crypto = webcrypto;
 
 const app = express();
@@ -14,13 +14,17 @@ app.use(express.json());
 ======================= */
 const WORKER_SECRET = process.env.WORKER_SECRET;
 
+// Your Polymarket-connected EOA private key (the one you already used)
 const PM_PRIVATE_KEY = process.env.PM_PRIVATE_KEY;
+
 const PM_CLOB_HOST = process.env.PM_CLOB_HOST || "https://clob.polymarket.com";
 const PM_GAMMA_HOST = process.env.PM_GAMMA_HOST || "https://gamma-api.polymarket.com";
 
-// You said: trade through Polymarket.com account (browser wallet connection)
-const PM_SIGNATURE_TYPE = Number(process.env.PM_SIGNATURE_TYPE || 2); // MUST be 2 for GNOSIS_SAFE (browser wallet)
-const PM_FUNDER_ADDRESS = process.env.PM_FUNDER_ADDRESS; // Your proxy wallet address
+// You said: trade via Polymarket.com account using GNOSIS_SAFE mode
+// SIGNATURE_TYPE = 2 and FUNDER_ADDRESS = proxy wallet
+const PM_SIGNATURE_TYPE = Number(process.env.PM_SIGNATURE_TYPE ?? 2);
+const PM_FUNDER_ADDRESS =
+  process.env.PM_FUNDER_ADDRESS || "0xEa50b96ea3F25BD138d9A8A04B19570058e84929";
 
 const PORT = Number(process.env.PORT || 3000);
 const CHAIN_ID = 137; // Polygon mainnet
@@ -31,10 +35,6 @@ if (!WORKER_SECRET) {
 }
 if (!PM_PRIVATE_KEY) {
   console.error("Missing PM_PRIVATE_KEY");
-  process.exit(1);
-}
-if (!PM_FUNDER_ADDRESS) {
-  console.error("Missing PM_FUNDER_ADDRESS (proxy wallet address)");
   process.exit(1);
 }
 
@@ -54,105 +54,109 @@ function isDryRun(req) {
 }
 
 /* =======================
-   CLOB CLIENT INIT
-   IMPORTANT: For Polymarket.com proxy mode, DO NOT paste API keys.
-   You MUST derive user creds via createOrDeriveApiKey() using your private key.
+   CLIENT INIT
 ======================= */
 let signer = null;
 let signerAddress = null;
-let client = null;
-let initPromise = null;
+let clobClient = null;
+let clientInitPromise = null;
 
 async function initClient() {
-  if (client) return client;
-  if (initPromise) return initPromise;
+  if (clobClient) return clobClient;
+  if (clientInitPromise) return clientInitPromise;
 
-  initPromise = (async () => {
-    try {
-      console.log("[BOOT] version=pm-proxy-v1");
-      console.log(`[Worker] Host=${PM_CLOB_HOST} ChainId=${CHAIN_ID}`);
-      console.log(`[Worker] SignatureType=${PM_SIGNATURE_TYPE} Funder=${PM_FUNDER_ADDRESS}`);
+  clientInitPromise = (async () => {
+    console.log("[BOOT] version=fok-v1");
+    console.log(`[BOOT] host=${PM_CLOB_HOST} chain=${CHAIN_ID} sigType=${PM_SIGNATURE_TYPE}`);
+    console.log(`[BOOT] funder=${PM_FUNDER_ADDRESS}`);
 
-      // ethers v5 wallet signer
-      signer = new Wallet(PM_PRIVATE_KEY);
-      signerAddress = await signer.getAddress();
-      console.log(`[Worker] Signer address=${signerAddress}`);
+    signer = new Wallet(PM_PRIVATE_KEY); // ethers v5 wallet
+    signerAddress = await signer.getAddress();
+    console.log(`[BOOT] signer=${signerAddress}`);
 
-      // Step 1: temp client
-      const temp = new ClobClient(PM_CLOB_HOST, CHAIN_ID, signer);
+    // Step 1: initialize minimal client (no L2 creds)
+    const tmp = new ClobClient(PM_CLOB_HOST, CHAIN_ID, signer);
 
-      // Step 2: derive USER creds (this is the key fix)
-      const userApiCreds = await temp.createOrDeriveApiKey();
-      console.log(`[Worker] Derived user API key=${String(userApiCreds?.apiKey || "").slice(0, 8)}...`);
+    // Step 2: derive USER api creds from private key (this is critical)
+    const userApiCreds = await tmp.createOrDeriveApiKey();
 
-      // Step 3/4: full authenticated client in proxy mode
-      client = new ClobClient(
-        PM_CLOB_HOST,
-        CHAIN_ID,
-        signer,
-        userApiCreds,
-        PM_SIGNATURE_TYPE,
-        PM_FUNDER_ADDRESS
-      );
+    // Step 3: reinitialize with full auth (sig type + funder address)
+    clobClient = new ClobClient(
+      PM_CLOB_HOST,
+      CHAIN_ID,
+      signer,
+      userApiCreds,
+      PM_SIGNATURE_TYPE,
+      PM_FUNDER_ADDRESS
+    );
 
-      console.log("[Worker] CLOB client ready");
-      return client;
-    } catch (err) {
-      console.error("[Worker] initClient failed:", err?.message || err);
-      initPromise = null;
-      throw err;
-    }
+    console.log("[BOOT] CLOB client ready");
+    return clobClient;
   })();
 
-  return initPromise;
+  return clientInitPromise;
 }
 
 /* =======================
    ROUTES
 ======================= */
 
-// Version endpoint so you can confirm Railway deployed THIS code
+// Deployment verification
 app.get("/version", (req, res) => {
   res.json({
-    version: "pm-proxy-v1",
+    version: "fok-v1",
     node: process.version,
-    timestamp: new Date().toISOString(),
+    signer: signerAddress || null,
+    funder: PM_FUNDER_ADDRESS,
+    signatureType: PM_SIGNATURE_TYPE,
+    clobHost: PM_CLOB_HOST,
+    gammaHost: PM_GAMMA_HOST,
+    timestamp: new Date().toISOString()
   });
 });
 
 app.get("/health", async (req, res) => {
   res.json({
     ok: true,
-    version: "pm-proxy-v1",
-    signerAddress: signerAddress || null,
-    clientStatus: client ? "ready" : initPromise ? "initializing" : "not_initialized",
+    clientStatus: clobClient ? "ready" : clientInitPromise ? "initializing" : "not_initialized",
+    signer: signerAddress || null,
+    funder: PM_FUNDER_ADDRESS,
+    signatureType: PM_SIGNATURE_TYPE,
     clobHost: PM_CLOB_HOST,
     gammaHost: PM_GAMMA_HOST,
-    signatureType: PM_SIGNATURE_TYPE,
-    funderAddress: PM_FUNDER_ADDRESS,
-    timestamp: new Date().toISOString(),
+    timestamp: new Date().toISOString()
   });
 });
 
+// Open orders (debug + monitoring)
 app.get("/orders", requireAuth, async (req, res) => {
   try {
-    const c = await initClient();
-    const openOrders = await c.getOpenOrders();
+    const client = await initClient();
+    const openOrders = await client.getOpenOrders();
     return res.json({ success: true, count: openOrders?.length || 0, orders: openOrders });
   } catch (err) {
-    console.error("[Worker] /orders error:", err?.message || err);
     return res.status(500).json({ success: false, error: err?.message || String(err) });
   }
 });
 
-// Place limit order
-// Body: { tokenId, side, price, size }
-// Optional: X-Dry-Run: 1
+/**
+ * Place order (supports FOK)
+ * Body: { tokenId, side, price, size, tickSize, negRisk, orderType? }
+ * orderType: "FOK" | "IOC" | "GTC" (default FOK)
+ */
 app.post("/place", requireAuth, async (req, res) => {
   const dryRun = isDryRun(req);
 
   try {
-    const { tokenId, side, price, size } = req.body || {};
+    const {
+      tokenId,
+      side,
+      price,
+      size,
+      tickSize,
+      negRisk,
+      orderType = "FOK"
+    } = req.body || {};
 
     if (!tokenId || !side || typeof price !== "number" || typeof size !== "number") {
       return res.status(400).json({ success: false, error: "invalid_body" });
@@ -162,68 +166,86 @@ app.post("/place", requireAuth, async (req, res) => {
     if (normalizedSide !== "BUY" && normalizedSide !== "SELL") {
       return res.status(400).json({ success: false, error: "side_must_be_BUY_or_SELL" });
     }
-    if (price <= 0 || price >= 1) {
+
+    if (!(price > 0 && price < 1)) {
       return res.status(400).json({ success: false, error: "price_must_be_between_0_and_1" });
     }
-    if (size <= 0) {
+    if (!(size > 0)) {
       return res.status(400).json({ success: false, error: "size_must_be_positive" });
     }
 
-    console.log(
-      `[Worker] ${dryRun ? "[DRY-RUN] " : ""}PLACE ${normalizedSide} token=${String(tokenId).slice(0, 16)}... price=${price} size=${size}`
-    );
+    // tickSize/negRisk should be passed from the caller (edge function)
+    if (!tickSize || typeof tickSize !== "string") {
+      return res.status(400).json({ success: false, error: "tickSize_required_as_string" });
+    }
+    if (typeof negRisk !== "boolean") {
+      return res.status(400).json({ success: false, error: "negRisk_required_as_boolean" });
+    }
 
-    const c = await initClient();
+    const client = await initClient();
 
     if (dryRun) {
-      return res.json({ success: true, dryRun: true, orderId: null, message: "validated_only" });
+      return res.json({
+        success: true,
+        dryRun: true,
+        message: "validated_only",
+        params: { tokenId, side: normalizedSide, price, size, tickSize, negRisk, orderType }
+      });
     }
 
     const sideEnum = normalizedSide === "BUY" ? Side.BUY : Side.SELL;
 
-    // IMPORTANT: get market to use correct tickSize/negRisk
-    const market = await c.getMarket(tokenId);
+    // Map orderType string to SDK enum
+    const ot = String(orderType).toUpperCase();
+    const orderTypeEnum =
+      ot === "IOC" ? OrderType.IOC :
+      ot === "GTC" ? OrderType.GTC :
+      OrderType.FOK; // default
 
-    const resp = await c.createAndPostOrder(
-      {
-        tokenID: tokenId,
-        price,
-        size,
-        side: sideEnum,
-      },
-      {
-        tickSize: market?.tickSize,
-        negRisk: market?.negRisk,
-      },
-      OrderType.GTC
+    console.log(
+      `[PLACE] ${ot} ${normalizedSide} token=${String(tokenId).slice(0, 18)}... price=${price} size=${size} tick=${tickSize} negRisk=${negRisk}`
     );
+
+    const resp = await client.createAndPostOrder(
+      { tokenID: tokenId, price, size, side: sideEnum },
+      { tickSize, negRisk },
+      orderTypeEnum
+    );
+
+    const orderId = resp?.orderID || resp?.id || resp?.order_id || null;
 
     return res.json({
       success: true,
       dryRun: false,
-      orderId: resp?.orderID || null,
-      status: resp?.status || null,
-      response: resp,
+      orderId,
+      response: resp
     });
   } catch (err) {
-    console.error("[Worker] /place error:", err?.message || err);
-    return res.status(500).json({ success: false, error: err?.message || String(err) });
+    // IMPORTANT: If Polymarket returns a structured error, bubble it up
+    return res.status(500).json({
+      success: false,
+      error: err?.message || String(err),
+      details: err?.response?.data || null
+    });
   }
 });
 
 app.post("/cancel", requireAuth, async (req, res) => {
+  const dryRun = isDryRun(req);
+
   try {
     const { orderId } = req.body || {};
     if (!orderId) return res.status(400).json({ success: false, error: "missing_orderId" });
 
-    console.log(`[Worker] CANCEL orderId=${orderId}`);
+    const client = await initClient();
 
-    const c = await initClient();
-    const result = await c.cancelOrder(orderId);
+    if (dryRun) {
+      return res.json({ success: true, dryRun: true, cancelled: false, message: "validated_only" });
+    }
 
-    return res.json({ success: true, cancelled: true, result });
+    const result = await client.cancelOrder(orderId);
+    return res.json({ success: true, dryRun: false, cancelled: true, result });
   } catch (err) {
-    console.error("[Worker] /cancel error:", err?.message || err);
     return res.status(500).json({ success: false, error: err?.message || String(err) });
   }
 });
@@ -233,13 +255,12 @@ app.get("/positions", requireAuth, async (req, res) => {
     const tokenId = req.query.tokenId;
     if (!tokenId) return res.status(400).json({ success: false, error: "missing_tokenId" });
 
-    const c = await initClient();
-    const bal = await c.getBalanceAllowance(tokenId);
+    const client = await initClient();
+    const bal = await client.getBalanceAllowance(tokenId);
     const shares = Number(bal?.balance || 0);
 
     return res.json({ success: true, tokenId, shares, raw: bal });
   } catch (err) {
-    console.error("[Worker] /positions error:", err?.message || err);
     return res.status(500).json({ success: false, error: err?.message || String(err) });
   }
 });
@@ -249,4 +270,6 @@ app.get("/positions", requireAuth, async (req, res) => {
 ======================= */
 app.listen(PORT, () => {
   console.log(`[Worker] listening on ${PORT}`);
+  // Attempt warm init (non-fatal if it fails)
+  initClient().catch((e) => console.error("[Worker] init failed:", e?.message || e));
 });
